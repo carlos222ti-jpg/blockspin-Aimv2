@@ -1,0 +1,316 @@
+--!strict
+-- WeaponTagger: Server-side script that identifies real weapons and tags them with ESP_WeaponName
+-- Runs on server so it can read script sources and detect weapon types reliably
+
+local playersService: Players = game:GetService("Players")
+
+-- Keywords that indicate a child is NOT a real weapon name
+local ACTION_KEYWORDS: { string } = {
+	"anim", "animation", "sound", "sfx", "hit", "reload", "shoot", "fire",
+	"equip", "unequip", "idle", "charge", "aim", "aiming", "kick", "recoil",
+	"pump", "cock", "draw", "holster", "muzzle", "barrel", "casing", "shell",
+	"particle", "effect", "vfx", "trail", "smoke", "flash", "spark", "explosion",
+	"swing", "strike", "slash", "attack", "damage", "impact", "block", "parry",
+	"dash", "walk", "run", "jump", "fall", "land", "death", "spawn", "stun",
+	"critical", "combo", "special", "ultimate", "remote", "gui", "weld",
+	"attachment", "config", "value", "motor", "constraint", "force",
+}
+
+-- Default child names that are engine/system names, not weapon names
+local DEFAULT_NAMES: { string } = {
+	"Handle", "Grip", "Main", "Fire", "Script", "LocalScript", "ModuleScript",
+	"Weld", "Attachment", "Values", "Config", "HumanoidRootPart", "Head", "Torso",
+	"AnimReload", "Reload", "Anim", "Animation", "HitReload", "Shoot", "FireAnim",
+	"EquipAnim", "IdleAnim", "ReloadAnim", "ShootAnim", "Charge", "Muzzle", "Barrel",
+	"Mag", "Chamber", "Bolt", "Slide", "Hammer", "Trigger", "Stock", "Sight",
+	"Scope", "Suppressor", "Silencer", "Laser", "Flashlight", "Ammo", "Bullet",
+	"Shell", "Casing", "Particles", "Sound", "Sounds", "FireSound", "ReloadSound",
+	"EquipSound", "UnequipSound", "Recoil", "Kick", "Pump", "Cock", "Draw",
+	"Holster", "Aim", "Aiming", "Idle", "IdleAnimation", "HitAnimation", "HitSound",
+	"SwingAnimation", "SwingSound", "StrikeAnimation", "StrikeSound",
+	"SlashAnimation", "SlashSound", "AttackAnimation", "AttackSound",
+	"DamageSound", "HitMarker", "ImpactSound", "EquipAnimation",
+	"HoldAnimation", "BlockAnimation", "ParryAnimation", "DashAnimation",
+	"WalkAnimation", "RunAnimation", "JumpAnimation", "FallAnimation",
+	"LandAnimation", "DeathAnimation", "SpawnAnimation", "StunAnimation",
+	"CriticalAnimation", "CriticalSound", "ComboAnimation", "ComboSound",
+	"ChargeAnimation", "ChargeSound", "SpecialAnimation", "SpecialSound",
+	"UltimateAnimation", "UltimateSound", "RemoteEvent", "RemoteFunction",
+	"IntValue", "NumberValue", "BoolValue", "StringValue", "ObjectValue",
+	"Vector3Value", "Color3Value", "BrickColorValue", "ScreenGui",
+	"SurfaceGui", "BillboardGui",
+}
+
+local function isNumeric(str: string): boolean
+	return tonumber(str) ~= nil
+end
+
+local function looksLikeActionState(name: string): boolean
+	local lower: string = name:lower()
+	for _, keyword: string in ipairs(ACTION_KEYWORDS) do
+		if lower:find(keyword) then
+			return true
+		end
+	end
+	if tonumber(name) then
+		return true
+	end
+	return false
+end
+
+local function isDefaultName(name: string): boolean
+	for _, d: string in ipairs(DEFAULT_NAMES) do
+		if name == d then
+			return true
+		end
+	end
+	return false
+end
+
+local function cleanToolName(name: string): string
+	local cleaned: string = name
+	local prefixes: { string } = { "tools_cinder_", "tool_", "cinder_", "weapon_", "item_", "tools_", "gear_", "weapons_" }
+	for _, prefix: string in ipairs(prefixes) do
+		if cleaned:lower():sub(1, #prefix) == prefix then
+			cleaned = cleaned:sub(#prefix + 1)
+			break
+		end
+	end
+	cleaned = cleaned:gsub("[_-]", " ")
+	cleaned = cleaned:gsub("%s+", " ")
+	cleaned = cleaned:sub(1, 1):upper() .. cleaned:sub(2)
+	return cleaned
+end
+
+-- Patterns to scan script source for weapon names
+local NAME_PATTERNS: { string } = {
+	'Name%s*=%s*"([%w%p%s]-)"',
+	'name%s*=%s*"([%w%p%s]-)"',
+	'["\']Name["\']%s*=%s*"([%w%p%s]-)"',
+	'["\']name["\']%s*=%s*"([%w%p%s]-)"',
+	'DisplayName%s*=%s*"([%w%p%s]-)"',
+	'WeaponName%s*=%s*"([%w%p%s]-)"',
+	'd["\']ToolName["\']%s*=%s*"([%w%p%s]-)"',
+}
+
+local function scanSourceForName(source: string): string?
+	for _, pattern: string in ipairs(NAME_PATTERNS) do
+		local match: string? = source:match(pattern)
+		if match and match ~= "" and not isNumeric(match) and not looksLikeActionState(match) then
+			return match
+		end
+	end
+	return nil
+end
+
+local function tryGetNameFromModule(module: ModuleScript): string?
+	local success: boolean, result: any = pcall(function()
+		return require(module)
+	end)
+	if success and type(result) == "table" then
+		local nameFields: { string } = { "Name", "WeaponName", "DisplayName", "GunName", "name", "weaponName", "displayName", "gunName", "ItemName", "itemName", "Display", "Weapon" }
+		for _, field: string in ipairs(nameFields) do
+			local val: any = result[field]
+			if type(val) == "string" and val ~= "" and not looksLikeActionState(val) then
+				return val
+			end
+		end
+		if type(result[1]) == "string" and result[1] ~= "" and not looksLikeActionState(result[1]) then
+			return result[1]
+		end
+	elseif success and type(result) == "string" and result ~= "" and not looksLikeActionState(result) then
+		return result
+	end
+	return scanSourceForName(module.Source)
+end
+
+local function tryGetNameFromScript(script: LuaSourceContainer): string?
+	return scanSourceForName(script.Source)
+end
+
+local function findNameInDescendants(instance: Instance): string?
+	for _, desc: Instance in ipairs(instance:GetDescendants()) do
+		if not isNumeric(desc.Name) and desc.Name ~= "" and not looksLikeActionState(desc.Name) then
+			return desc.Name
+		end
+	end
+	return nil
+end
+
+local function getWeaponName(tool: Tool): string
+	-- 1. StringValue children with readable names
+	for _, child: Instance in ipairs(tool:GetChildren()) do
+		if child:IsA("StringValue") and child.Value ~= "" then
+			if looksLikeActionState(child.Name) or looksLikeActionState(child.Value) then
+				continue
+			end
+			if not isDefaultName(child.Name) then
+				return cleanToolName(child.Value)
+			end
+		end
+	end
+
+	-- 2. ToolTip
+	if tool.ToolTip ~= "" then
+		return cleanToolName(tool.ToolTip)
+	end
+
+	-- 3. Attributes
+	local attrChecks: { string } = { "WeaponName", "DisplayName", "GunName", "weaponName", "ItemName", "Name", "Weapon", "Gun" }
+	for _, attrName: string in ipairs(attrChecks) do
+		local attrValue: any = tool:GetAttribute(attrName)
+		if attrValue and type(attrValue) == "string" and attrValue ~= "" then
+			return cleanToolName(attrValue)
+		end
+	end
+
+	-- 4. Direct children (non-numeric, non-default, non-action)
+	for _, child: Instance in ipairs(tool:GetChildren()) do
+		if not isNumeric(child.Name) and child.Name ~= "" and not looksLikeActionState(child.Name) and not isDefaultName(child.Name) then
+			return cleanToolName(child.Name)
+		end
+	end
+
+	-- 5. Folder/Configuration children
+	for _, child: Instance in ipairs(tool:GetChildren()) do
+		if child:IsA("Folder") or child:IsA("Configuration") then
+			for _, sub: Instance in ipairs(child:GetChildren()) do
+				if sub:IsA("StringValue") and sub.Value ~= "" and not isNumeric(sub.Value) and not looksLikeActionState(sub.Value) then
+					return cleanToolName(sub.Value)
+				end
+				if sub:IsA("ModuleScript") then
+					local name: string? = tryGetNameFromModule(sub)
+					if name and not looksLikeActionState(name) then
+						return cleanToolName(name)
+					end
+				end
+			end
+		end
+	end
+
+	-- 6. ModuleScript children
+	for _, child: Instance in ipairs(tool:GetChildren()) do
+		if child:IsA("ModuleScript") then
+			local name: string? = tryGetNameFromModule(child)
+			if name and not looksLikeActionState(name) then
+				return cleanToolName(name)
+			end
+		end
+	end
+
+	-- 7. Script/LocalScript source code
+	for _, child: Instance in ipairs(tool:GetChildren()) do
+		if child:IsA("Script") or child:IsA("LocalScript") then
+			local name: string? = tryGetNameFromScript(child)
+			if name and not looksLikeActionState(name) then
+				return cleanToolName(name)
+			end
+		end
+	end
+
+	-- 8. ObjectValue references
+	for _, child: Instance in ipairs(tool:GetChildren()) do
+		if child:IsA("ObjectValue") and child.Value then
+			local target: Instance = child.Value :: Instance
+			if target:IsA("ModuleScript") then
+				local name: string? = tryGetNameFromModule(target)
+				if name and not looksLikeActionState(name) then
+					return cleanToolName(name)
+				end
+			end
+			if not isNumeric(target.Name) and not looksLikeActionState(target.Name) then
+				return cleanToolName(target.Name)
+			end
+		end
+	end
+
+	-- 9. Search descendants
+	local descName: string? = findNameInDescendants(tool)
+	if descName and not looksLikeActionState(descName) then
+		return cleanToolName(descName)
+	end
+
+	-- 10. Fall back to tool name
+	if looksLikeActionState(tool.Name) then
+		return "None"
+	end
+	return cleanToolName(tool.Name)
+end
+
+local function tagTool(tool: Tool): ()
+	local newName: string = getWeaponName(tool)
+	tool:SetAttribute("ESP_WeaponName", newName)
+end
+
+local function tagAllToolsInInstance(instance: Instance): ()
+	for _, descendant: Instance in ipairs(instance:GetDescendants()) do
+		if descendant:IsA("Tool") then
+			tagTool(descendant :: Tool)
+		end
+	end
+end
+
+-- Tag existing tools in workspace, ReplicatedStorage, Lighting, ServerStorage
+tagAllToolsInInstance(workspace)
+tagAllToolsInInstance(game:GetService("ReplicatedStorage"))
+tagAllToolsInInstance(game:GetService("Lighting"))
+tagAllToolsInInstance(game:GetService("ServerStorage"))
+
+-- Scan backpacks and characters of existing players
+for _, p: Player in ipairs(playersService:GetPlayers()) do
+	local backpack: Backpack? = p:FindFirstChildOfClass("Backpack")
+	if backpack then
+		tagAllToolsInInstance(backpack)
+		backpack.ChildAdded:Connect(function(child: Instance)
+			if child:IsA("Tool") then
+				task.defer(function()
+					tagTool(child :: Tool)
+				end)
+			end
+		end)
+	end
+	local character: Model? = p.Character
+	if character then
+		tagAllToolsInInstance(character)
+	end
+end
+
+-- When player joins, set up monitoring
+playersService.PlayerAdded:Connect(function(newPlayer: Player)
+	local backpack: Backpack? = newPlayer:WaitForChild("Backpack") :: Backpack
+	task.defer(function()
+		tagAllToolsInInstance(backpack)
+	end)
+	backpack.ChildAdded:Connect(function(child: Instance)
+		if child:IsA("Tool") then
+			local tool: Tool = child :: Tool
+			tagTool(tool)
+			task.delay(1, function()
+				tagTool(tool)
+			end)
+		end
+	end)
+
+	newPlayer.CharacterAdded:Connect(function(character: Model)
+		character.ChildAdded:Connect(function(child: Instance)
+			if child:IsA("Tool") then
+				local tool: Tool = child :: Tool
+				tagTool(tool)
+				task.delay(1, function()
+					tagTool(tool)
+				end)
+			end
+		end)
+	end)
+end)
+
+-- Watch for new tools in workspace
+workspace.ChildAdded:Connect(function(child: Instance)
+	if child:IsA("Tool") then
+		task.defer(function()
+			tagTool(child :: Tool)
+		end)
+	end
+end)
+
+print("[WeaponTagger] Loaded and running")
